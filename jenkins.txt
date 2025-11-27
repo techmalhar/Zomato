@@ -1,0 +1,179 @@
+pipeline {
+    agent any
+    tools {
+        jdk 'jdk17'
+        nodejs 'node25'
+    }
+    environment {
+        SCANNER_HOME = tool 'sonar-scanner'
+        DOCKER_IMAGE = 'techmalhar/zomato:latest'
+    }
+    stages {
+        stage ("Clean Workspace") {
+            steps {
+                cleanWs()
+            }
+        }
+        stage ("Git Checkout") {
+            steps {
+                git branch: 'main', url: 'https://github.com/techmalhar/Zomato.git'
+            }
+        }
+        stage("Create Complete React App Structure") {
+            steps {
+                sh """
+                    # Create public folder and required files
+                    mkdir -p public
+                    echo '<!DOCTYPE html>
+                    <html lang="en">
+                    <head>
+                        <meta charset="utf-8" />
+                        <link rel="icon" href=\"%PUBLIC_URL%/favicon.ico\" />
+                        <meta name="viewport" content="width=device-width, initial-scale=1" />
+                        <meta name="theme-color" content="#000000" />
+                        <meta name="description" content="Zomato clone application" />
+                        <title>Zomato Clone</title>
+                    </head>
+                    <body>
+                        <noscript>You need to enable JavaScript to run this app.</noscript>
+                        <div id="root"></div>
+                    </body>
+                    </html>' > public/index.html
+                    
+                    # Create other required public files
+                    touch public/favicon.ico
+                    echo "User-agent: *" > public/robots.txt
+                    echo "Disallow:" >> public/robots.txt
+                    
+                    # Create src folder and basic React files
+                    mkdir -p src
+                    echo 'import React from \"react\";
+import ReactDOM from \"react-dom/client\";
+import App from \"./App\";
+
+const root = ReactDOM.createRoot(document.getElementById(\"root\"));
+root.render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>
+);' > src/index.js
+
+                    echo 'import React from \"react\";
+import \"./App.css\";
+
+function App() {
+  return (
+    <div className=\"App\">
+      <h1>Zomato Clone</h1>
+      <p>Welcome to Zomato Clone Application</p>
+    </div>
+  );
+}
+
+export default App;' > src/App.js
+
+                    echo '.App {
+  text-align: center;
+}' > src/App.css
+                """
+            }
+        }
+        stage("Sonarqube Analysis") {
+            steps {
+                withSonarQubeEnv('sonar-server') {
+                    sh """ 
+                        $SCANNER_HOME/bin/sonar-scanner -Dsonar.projectName=zomato \
+                        -Dsonar.projectKey=zomato 
+                    """
+                }
+            }
+        }
+        stage("Code Quality Gate") {
+            steps {
+                script {
+                    waitForQualityGate abortPipeline: false, credentialsId: 'Sonar-token' 
+                }
+            } 
+        }
+        stage("Install NPM Dependencies") {
+            steps {
+                sh "npm install"
+            }
+        }
+        stage('OWASP FS SCAN') {
+            steps {
+                dependencyCheck additionalArguments: '--scan ./ --disableYarnAudit --disableNodeAudit --update -n', odcInstallation: 'DP-Check'
+                dependencyCheckPublisher pattern: '**/dependency-check-report.xml'
+            }
+        }
+        stage ("Trivy File Scan") {
+            steps {
+                sh "trivy fs . > trivy.txt"
+            }
+        }
+        stage ("Build Docker Image") {
+            steps {
+                sh "docker build -t zomato ."
+            }
+        }
+        stage ("Tag & Push to DockerHub") {
+            steps {
+                script {
+                    withDockerRegistry(credentialsId: 'docker') {
+                        sh "docker tag zomato ${DOCKER_IMAGE}"
+                        sh "docker push ${DOCKER_IMAGE}"
+                    }
+                }
+            }
+        }
+        stage('Docker Scout Image') {
+            steps {
+                script {
+                    withDockerRegistry(credentialsId: 'docker') {
+                        sh """
+                            docker-scout quickview ${DOCKER_IMAGE} || echo "Docker Scout quickview completed with warnings"
+                            docker-scout cves ${DOCKER_IMAGE} || echo "Docker Scout cves completed with warnings"
+                            docker-scout recommendations ${DOCKER_IMAGE} || echo "Docker Scout recommendations completed with warnings"
+                        """
+                    }
+                }
+            }
+        }
+        stage ("Deploy to Container") {
+            steps {
+                sh "docker rm -f zomato || true"
+                sh "docker run -d --name zomato -p 3000:3000 ${DOCKER_IMAGE}"
+            }
+        }
+    }
+    post {
+        always {
+            emailext attachLog: true,
+                subject: "'${currentBuild.result}' - Zomato Project",
+                body: """
+                    <html>
+                    <body>
+                        <div style="background-color: #FFA07A; padding: 10px; margin-bottom: 10px;">
+                            <p style="color: white; font-weight: bold;">Project: ${env.JOB_NAME}</p>
+                        </div>
+                        <div style="background-color: #90EE90; padding: 10px; margin-bottom: 10px;">
+                            <p style="color: white; font-weight: bold;">Build Number: ${env.BUILD_NUMBER}</p>
+                        </div>
+                        <div style="background-color: #87CEEB; padding: 10px; margin-bottom: 10px;">
+                            <p style="color: white; font-weight: bold;">Status: ${currentBuild.result}</p>
+                        </div>
+                        <div style="background-color: #DDA0DD; padding: 10px; margin-bottom: 10px;">
+                            <p style="color: white; font-weight: bold;">URL: ${env.BUILD_URL}</p>
+                        </div>
+                        <div style="background-color: #FFD700; padding: 10px;">
+                            <p style="color: black; font-weight: bold;">Docker Image: ${DOCKER_IMAGE}</p>
+                        </div>
+                    </body>
+                    </html>
+                """,
+                to: 'cloudstech02@gmail.com',
+                mimeType: 'text/html',
+                attachmentsPattern: 'trivy.txt'
+        }
+    }
+}
